@@ -298,6 +298,151 @@ Adds the domain + kicks off verification. Polling endpoint: `GET /v9/projects/$P
 
 ---
 
+## ④.5 Auto-deploy via GitHub Actions (when Vercel's GitHub App isn't an option)
+
+Vercel's native GitHub integration installs a GitHub App on the repo owner.
+It's the smoothest path — but **the App can't be auto-installed**. The owner
+has to click through `https://github.com/apps/vercel/installations/new`,
+which means you can't fully script first-time deploys.
+
+You also can't use it when:
+- The deploying account (e.g. `gh` logged in as `someone-else`) lacks repo
+  Settings → Secrets write permission on the target repo
+- You want **path-filtered** triggers (monorepo: only `web/**` deploys; CLI
+  changes don't burn CI minutes)
+- You want CI-controllable build/test gating before the deploy promotes
+
+Workaround: **deploy via Vercel CLI from GitHub Actions** using a stored
+token. Setup is one workflow file + three repo secrets.
+
+### Setup
+
+```bash
+# 1. Get a Vercel token. Best practice: vercel.com/account/tokens → New →
+#    name "ci-<project>", set scope, ~1 year expiry. MVP shortcut: use the
+#    CLI's own session token (~/Library/Application Support/com.vercel.cli
+#    /auth.json on macOS). Either way rotate before sharing the repo.
+VT=$(cat ~/Library/Application\ Support/com.vercel.cli/auth.json \
+       | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"], end="")')
+
+# 2. Find the project + org IDs.
+PROJECT_ID=$(cat web/.vercel/project.json | jq -r .projectId)
+ORG_ID=$(cat web/.vercel/project.json | jq -r .orgId)
+
+# 3. Push them as repo secrets. CRITICAL: use --body, NOT `echo | --body -`.
+#    Echo's trailing newline ends up in the secret value and Vercel CLI then
+#    rejects the env var with the cryptic "must not contain ***" (see GOTCHA
+#    below for what's happening). Direct --body avoids it entirely.
+gh secret set VERCEL_TOKEN      --repo OWNER/REPO --body "$VT"
+gh secret set VERCEL_ORG_ID     --repo OWNER/REPO --body "$ORG_ID"
+gh secret set VERCEL_PROJECT_ID --repo OWNER/REPO --body "$PROJECT_ID"
+```
+
+### Workflow file
+
+Drop this at `.github/workflows/deploy-web.yml`. Replace `web` with your
+sub-directory (or remove `working-directory:` for repos with the Next.js
+app at the root).
+
+```yaml
+name: Deploy web → Vercel
+
+on:
+  push:
+    branches: [main]
+    paths: ["web/**", ".github/workflows/deploy-web.yml"]
+  pull_request:
+    branches: [main]
+    paths: ["web/**"]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults: { run: { working-directory: web } }
+    env:
+      # Pass via env, NOT `--token` flag. See GOTCHA below.
+      VERCEL_TOKEN:     ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID:    ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - run: npm install -g vercel@latest
+      - name: Pull env
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            vercel pull --yes --environment=preview
+          else
+            vercel pull --yes --environment=production
+          fi
+      - name: Build
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            vercel build
+          else
+            vercel build --prod
+          fi
+      - name: Deploy
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            vercel deploy --prebuilt
+          else
+            vercel deploy --prebuilt --prod
+          fi
+```
+
+### Project setting — **clear `rootDirectory`**
+
+If your workflow uses `working-directory: web`, set the Vercel project's
+`rootDirectory` to `null`. Otherwise both layers prepend `web/` and the CLI
+ends up looking at `web/web/package.json` — `ENOENT`.
+
+```bash
+curl -s -X PATCH \
+  -H "Authorization: Bearer $VERCEL_TOKEN" \
+  -H "content-type: application/json" \
+  "https://api.vercel.com/v9/projects/$PROJECT_ID?teamId=$ORG_ID" \
+  -d '{"rootDirectory":null}'
+```
+
+(The inverse — keep `rootDirectory=web` on the project, drop
+`working-directory` from the workflow — also works. Pick one.)
+
+### GOTCHA: do NOT use `--token` flag (and: no trailing newline in the secret)
+
+Two distinct traps. Both produce the same error:
+
+> `Error: You defined "***token", but its contents are invalid. Must not contain: "***"`
+
+The `***` is GitHub Actions redacting characters that *happen to be in your
+secret value*. Trailing `\n` in the secret causes substring matching across
+runner output to flag every `-` and `--` as redacted. The error message and
+the entire command line become unparseable garbage.
+
+**Fix 1 (always do this):** pass `VERCEL_TOKEN` via `env:`, not via
+`--token "${{ secrets.X }}"`. The CLI reads `VERCEL_TOKEN` natively; the
+flag is unnecessary. This eliminates the flag-redaction angle entirely.
+
+**Fix 2 (always do this):** when storing the secret, use `gh secret set
+--body "$VAR"`, not `echo "$VAR" | gh secret set --body -`. Echo appends
+`\n`; the newline corrupts the value and triggers the redaction storm above.
+
+### Verify
+
+```bash
+gh run list --repo OWNER/REPO --workflow "deploy-web.yml" --limit 1
+# in_progress → completed,success expected in ~60-90s
+gh workflow run "Deploy web → Vercel" --repo OWNER/REPO --ref main
+```
+
+After the first green run, add a `deployed_via: "github-actions"` marker to
+your `/api/health` route and push it — confirms the new pipeline (not a
+prior manual `vercel --prod`) put the build in production.
+
+---
+
 ## ⑤ Smoke test
 
 ```bash
@@ -403,6 +548,8 @@ See `references/gotchas.md` for the full list. Highlights:
 | Render Blueprint env loss | Service deploys but crashes on missing env | Edit env vars manually after Blueprint creation, click Save+rebuild |
 | Vercel Hobby cron limit | Deploy rejected with "limited to daily" | Move sub-daily crons to GitHub Actions |
 | Vercel env paste fail | Value cells empty after `dispatchEvent('input')` | Use `ClipboardEvent('paste')` instead |
+| Vercel CLI in CI: "must not contain ***" | GitHub redacts `--` in args when secret value has trailing `\n` | (a) pass `VERCEL_TOKEN` via env not `--token`; (b) `gh secret set --body "$X"`, never `echo "$X" \| gh secret set --body -` |
+| Vercel CI: `ENOENT: …/web/web/package.json` | Both Vercel project's `rootDirectory=web` AND workflow `working-directory: web` apply, doubling the path | Clear one of them: `PATCH /v9/projects/$ID {"rootDirectory":null}` |
 | GitHub OAuth anti-bot | Authorize button stuck disabled | Manual click — JS can't synthesize trusted gesture |
 | Render Free cold start | First request after idle waits 30–60 s | Schedule a ping every 13 min via GitHub Actions |
 | OAuth account picker | Username text split across DOM nodes, JS click misses | Find `<form action="…/oauth/authorize_app">` and call `.submit()` |
