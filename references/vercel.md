@@ -280,11 +280,19 @@ Workaround: **deploy via Vercel CLI from GitHub Actions** using a stored token. 
 ### Setup
 
 ```bash
-# 1. Get a Vercel token. Best practice: vercel.com/account/tokens → New →
-#    name "ci-<project>", set scope, ~1 year expiry. MVP shortcut: use the
-#    CLI's own session token at ~/Library/Application Support/com.vercel.cli/auth.json.
-VT=$(cat ~/Library/Application\ Support/com.vercel.cli/auth.json \
-       | python3 -c 'import json,sys; print(json.load(sys.stdin)["token"], end="")')
+# 1. Get a Vercel token.
+#    *** USE A REAL PAT, NOT THE CLI SESSION TOKEN. ***  vercel.com/account/tokens
+#    → Create → name "ci-<project>", scope = the team, Expiration = No Expiration
+#    (or 1y). Store it: `security add-generic-password -U -a "$USER" -s <name> -w 'vcp_...'`
+#
+#    The CLI session token (~/Library/Application Support/com.vercel.cli/auth.json)
+#    is tempting but it ROTATES ~daily — every CI deploy after it expires fails with
+#    "The token provided via VERCEL_TOKEN environment variable is not valid", and you
+#    end up re-setting the secret before every push. A no-expiration PAT ends that loop.
+#    (You can't mint a PAT from the session token via API — `vercel tokens create` and
+#    POST /v3/user/tokens both reject it with "Only user authentication tokens can be
+#    used to create new tokens." So the PAT must be created in the dashboard.)
+VT=$(security find-generic-password -s pp-vercel-pat -w)   # the PAT you stored above
 
 # 2. Find the project + org IDs.
 PROJECT_ID=$(cat web/.vercel/project.json | jq -r .projectId)
@@ -386,3 +394,61 @@ gh workflow run "Deploy web → Vercel" --repo OWNER/REPO --ref main
 ```
 
 After the first green run, add a `deployed_via: "github-actions"` marker to your `/api/health` route — confirms the new pipeline (not a prior manual `vercel --prod`) put the build in production.
+
+---
+
+## Setting env vars via the REST API (no UI, no CLI link)
+
+The paste trick is for humans at the dashboard. To script env vars from CI or a
+setup tool, hit the API directly — works without `vercel link`:
+
+```bash
+VT=$(security find-generic-password -s pp-vercel-pat -w)
+TEAM="team_xxx"   # your team id
+PRJ=$(curl -s -H "Authorization: Bearer $VT" \
+  "https://api.vercel.com/v9/projects?teamId=$TEAM&search=my-project" | jq -r '.projects[0].id')
+
+curl -s -X POST "https://api.vercel.com/v10/projects/$PRJ/env?teamId=$TEAM&upsert=true" \
+  -H "Authorization: Bearer $VT" -H "Content-Type: application/json" \
+  -d '{"key":"NEXT_PUBLIC_SUPABASE_URL","value":"https://x.supabase.co",
+       "type":"plain","target":["production","preview","development"]}'
+```
+
+- `upsert=true` makes it idempotent (set-or-update).
+- `type`: `plain` for non-secrets (incl. `NEXT_PUBLIC_*`, which are exposed to the
+  browser anyway), `encrypted` for secrets.
+- `target` must be an array. `NEXT_PUBLIC_*` vars need `production` AND `preview`
+  AND `development` or the build won't see them.
+- Env-var changes do NOT redeploy. Trigger a fresh deploy after.
+
+## Attack Challenge Mode — when curl gets 403 but browsers work
+
+**Symptom:** every path on your domain returns `403`, the body is an Astro-ish
+challenge page, and the response headers include:
+
+```
+x-vercel-mitigated: challenge
+x-vercel-challenge-token: ...
+```
+
+**Cause:** Vercel's Attack Challenge Mode is on (auto-triggered by a traffic spike
+— e.g. an aggressive `until curl ...; do` polling loop hammering the domain during
+deploy verification). It serves a JS proof-of-work that real browsers solve
+silently, so the site is fine for users — but `curl` (no JS) can't pass, so every
+scripted check returns 403 and looks like a total outage.
+
+**Fix:** disable it via the API (needs a valid token):
+
+```bash
+VT=$(security find-generic-password -s pp-vercel-pat -w)
+TEAM="team_xxx"; PRJ="prj_xxx"
+curl -s -X POST "https://api.vercel.com/v1/security/attack-mode?teamId=$TEAM" \
+  -H "Authorization: Bearer $VT" -H "Content-Type: application/json" \
+  -d "{\"projectId\":\"$PRJ\",\"attackModeEnabled\":false}"
+# → {"attackModeEnabled":false,...}  (edge propagation takes a minute)
+```
+
+**Avoid re-triggering it:** don't poll the live domain in tight loops. Verify via
+the GitHub Actions run status (`gh run view`) or space curls out (15s+). A
+headless browser (Playwright) also passes the challenge if you must check rendered
+output.

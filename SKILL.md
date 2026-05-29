@@ -559,6 +559,10 @@ See `references/gotchas.md` for the full list. Highlights:
 | `metadataBase` warning | Build warns about localhost OG | Set `NEXT_PUBLIC_SITE_URL` in Vercel, or trust runtime `VERCEL_URL` |
 | Supabase service_role key rotated | App breaks after old key revoked | Update both Vercel AND Render in same minute; restart Render service |
 | Upstash command exhaustion | 429 from REST endpoint | Free tier is 10 K commands/day; cache aggressively or upgrade |
+| Vercel CI token "not valid" daily | Secret holds the CLI session token, which rotates ~daily | Use a no-expiration PAT from vercel.com/account/tokens, not `auth.json` |
+| Whole domain 403, `x-vercel-mitigated: challenge` | Attack Challenge Mode (often tripped by tight curl-polling loops) | `POST /v1/security/attack-mode {attackModeEnabled:false}`; stop polling the live domain |
+| Auth email won't reach users / "can only send to your own address" | Provider needs domain verification before sending to strangers (full-access key doesn't bypass) | Verify a domain, OR use a real mailbox's SMTP (Gmail App Password) — no DNS. See `references/email.md` |
+| Supabase SMTP PATCH 200 but no effect | `smtp_port` sent as int | Send `"smtp_port": "465"` (string) |
 
 ---
 
@@ -572,7 +576,8 @@ zero-cost-deploy/
 │   ├── supabase.md                         # Management API endpoints, RLS patterns
 │   ├── upstash.md                          # Region options, REST surface
 │   ├── render.md                           # Blueprint quirks, env var workarounds
-│   ├── vercel.md                           # Hobby limits, paste trick, OG metadata
+│   ├── vercel.md                           # Hobby limits, paste trick, PAT vs session token, env-via-API, attack mode
+│   ├── email.md                            # Transactional email / magic links — SMTP, Resend domain verification, Gmail App Password
 │   ├── management-apis.md                  # Per-service REST endpoints catalog
 │   ├── browser-automation.md               # When to use osascript, when not to
 │   └── gotchas.md                          # Every weird issue + fix

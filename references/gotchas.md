@@ -306,3 +306,65 @@ Wait 5 min for Vercel to retry. Vercel will auto-issue once CAA allows.
 **Fix:**
 - Avoid System Events. Use only Chrome's `execute active tab javascript` — that doesn't need Accessibility.
 - If you must use System Events: System Settings → Privacy & Security → Accessibility → enable Terminal (or your IDE's embedded terminal).
+
+---
+
+## Vercel
+
+### CI deploys fail "VERCEL_TOKEN ... is not valid" — every day
+
+**Symptom:** the GitHub Actions deploy worked yesterday, today the `vercel pull`
+step fails with `The token provided via VERCEL_TOKEN environment variable is not
+valid`. You re-set the secret, it works, next day it breaks again.
+
+**Cause:** the secret holds the **Vercel CLI session token** (from
+`~/Library/Application Support/com.vercel.cli/auth.json`). That token rotates
+~daily, so CI breaks every time it expires.
+
+**Fix:** use a real **no-expiration Personal Access Token** from
+vercel.com/account/tokens as `VERCEL_TOKEN`. You can't mint a PAT from the
+session token (`vercel tokens create` and `POST /v3/user/tokens` both reject it:
+"Only user authentication tokens can be used to create new tokens") — create it
+in the dashboard. See `references/vercel.md`.
+
+### Whole domain returns 403, body is a challenge page, `x-vercel-mitigated: challenge`
+
+**Symptom:** every path 403s to `curl`, but the site loads fine in a real
+browser.
+
+**Cause:** Vercel Attack Challenge Mode — often auto-triggered by an aggressive
+`until curl ...; do sleep; done` deploy-verification loop hammering the domain.
+It serves a JS proof-of-work; browsers solve it, `curl` can't.
+
+**Fix:** `POST /v1/security/attack-mode {attackModeEnabled:false}` (see
+`references/vercel.md`). And stop tight-looping curl against the live domain —
+check `gh run view` for deploy status instead, or space requests 15s+.
+
+---
+
+## Email / SMTP
+
+### Signups 500 / no email arrives / "can only send to your own address"
+
+**Symptom:** auth emails don't arrive; Supabase returns 500 "Error sending
+confirmation email"; or your email provider says you can only send to your own
+account address.
+
+**Cause:** the provider (Resend/SendGrid/SES/…) requires **domain verification**
+before it will send to arbitrary recipients. A "full-access" API key does NOT
+bypass this — key permission and domain verification are unrelated.
+
+**Fix:** either verify a sending domain (DKIM/SPF/MX DNS records), or use a real
+mailbox's SMTP (Gmail App Password / QQ / Outlook) which sends to anyone with no
+DNS. Full playbook in `references/email.md`.
+
+### Supabase custom SMTP PATCH returns 200 but nothing changes
+
+**Symptom:** you PATCH `/config/auth` with smtp fields, get 200, but emails still
+use the built-in mailer and the smtp fields read back as null.
+
+**Cause:** `smtp_port` was sent as an integer (`465`). The config validator wants
+a **string** (`"465"`).
+
+**Fix:** send `"smtp_port": "465"`. To disable custom SMTP later, set smtp fields
+to `null` (not `""` — empty string fails email validation on `smtp_admin_email`).
